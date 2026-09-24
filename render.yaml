@@ -1,0 +1,22 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: workroom
+    runtime: node
+    plan: starter            # persistent disks need a paid instance; free instances lose data on every restart
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+      - key: MAX_UPLOAD_MB
+        value: "50"
+    disk:
+      name: workroom-data
+      mountPath: /var/data   # SQLite database + original photos live here
+      sizeGB: 10

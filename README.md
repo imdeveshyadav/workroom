@@ -34,6 +34,16 @@ docker build -t workroom .
 docker run -p 3000:3000 -v workroom-data:/data workroom
 ```
 
+### Deploy on Render
+
+The repo includes a `render.yaml` Blueprint.
+
+1. On Render, go to **New → Blueprint** and pick this repo.
+2. Click **Apply**. This creates a Node web service on the Starter plan, with a 10 GB persistent disk at `/var/data` that holds the database and original photos.
+3. Open the `https://workroom-xxxx.onrender.com` URL on your phone and choose **Add to Home Screen** (or **Install app**).
+
+The disk is needed because Render's free plan wipes local files whenever the service restarts or redeploys, so all messages and photos would be lost. The disk also means the service runs as a single instance, which is what the live updates expect.
+
 | Env var | Default | |
 |---|---|---|
 | `PORT` | `3000` | |
