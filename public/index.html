@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <title>Workroom</title>
+  <meta name="description" content="Group messaging for work teams with full-resolution photos and one-click chat export.">
+  <meta name="theme-color" content="#0f6b5c">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Workroom">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icons/icon-192.png">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ HOME ============ -->
+  <section id="home" class="screen home" hidden>
+    <div class="home-inner">
+      <div class="brand">
+        <img src="/icons/icon.svg" alt="" width="56" height="56">
+        <h1>Workroom</h1>
+        <p>Share site photos and updates with your team.</p>
+      </div>
+
+      <label class="field">
+        <span>Your name</span>
+        <input id="my-name" type="text" autocomplete="name" maxlength="40" placeholder="e.g. Devesh">
+      </label>
+
+      <div class="card">
+        <h2>Join a workroom</h2>
+        <form id="join-form" class="row">
+          <input id="join-code" type="text" inputmode="text" autocapitalize="characters" maxlength="6" placeholder="Room code" required>
+          <button class="btn primary" type="submit">Join</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>Create a workroom</h2>
+        <form id="create-form" class="row">
+          <input id="create-name" type="text" maxlength="60" placeholder="Workroom name" required>
+          <button class="btn" type="submit">Create</button>
+        </form>
+      </div>
+
+      <div id="recent-wrap" class="card" hidden>
+        <h2>Your workrooms</h2>
+        <ul id="recent" class="recent"></ul>
+      </div>
+
+      <button id="install-btn" class="btn ghost install" hidden>Install app on this phone</button>
+    </div>
+  </section>
+
+  <!-- ============ CHAT ============ -->
+  <section id="room" class="screen room" hidden>
+    <header class="topbar">
+      <button class="icon-btn" id="back-btn" aria-label="Back">
+        <svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg>
+      </button>
+      <button class="room-title" id="room-info-btn">
+        <div class="room-name" id="room-name"></div>
+        <div class="room-sub" id="room-sub"></div>
+      </button>
+      <button class="icon-btn" id="export-btn" aria-label="Export chat" title="Export chat">
+        <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+      </button>
+    </header>
+
+    <div id="conn" class="conn" hidden>Reconnecting…</div>
+    <main class="chat" id="chat">
+      <button id="load-older" class="load-older" hidden>Load earlier messages</button>
+      <div id="messages"></div>
+    </main>
+
+    <footer class="composer">
+      <div id="attach-preview" class="attach-preview" hidden>
+        <img id="attach-img" alt="">
+        <div class="attach-info">
+          <b id="attach-title"></b>
+          <span id="attach-meta"></span>
+        </div>
+        <button class="icon-btn small" id="attach-clear" aria-label="Remove">✕</button>
+      </div>
+
+      <div class="composer-row">
+        <button class="icon-btn" id="plus-btn" aria-label="Add photo">
+          <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+        <textarea id="text" rows="1" placeholder="Message" maxlength="5000"></textarea>
+        <button class="icon-btn" id="camera-btn" aria-label="Take photo">
+          <svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>
+        </button>
+        <button class="send-btn" id="send-btn" aria-label="Send">
+          <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 16-2-7z"/></svg>
+        </button>
+      </div>
+      <div id="upload-bar" class="upload-bar" hidden><div id="upload-fill"></div></div>
+
+      <input id="file-camera" type="file" accept="image/*" capture="environment" hidden>
+      <input id="file-gallery" type="file" accept="image/*" hidden>
+    </footer>
+  </section>
+</div>
+
+<!-- Attach sheet -->
+<div class="sheet-backdrop" id="attach-sheet" hidden>
+  <div class="sheet">
+    <div class="sheet-handle"></div>
+    <button class="sheet-item" data-act="camera"><span class="si-icon">📷</span>Take photo with camera</button>
+    <button class="sheet-item" data-act="gallery"><span class="si-icon">🖼️</span>Upload photo (full resolution)</button>
+    <button class="sheet-item" data-act="describe"><span class="si-icon">📝</span>Describe an earlier photo</button>
+    <button class="sheet-item cancel" data-act="cancel">Cancel</button>
+  </div>
+</div>
+
+<!-- Image picker (describe past image) -->
+<div class="sheet-backdrop" id="picker-sheet" hidden>
+  <div class="sheet tall">
+    <div class="sheet-handle"></div>
+    <div class="sheet-title">Choose a photo to describe</div>
+    <div class="picker-grid" id="picker-grid"></div>
+    <button class="sheet-item cancel" data-act="cancel">Cancel</button>
+  </div>
+</div>
+
+<!-- Export sheet -->
+<div class="sheet-backdrop" id="export-sheet" hidden>
+  <div class="sheet">
+    <div class="sheet-handle"></div>
+    <div class="sheet-title">Export chat</div>
+    <p class="sheet-note">Downloads an HTML file that looks exactly like this chat, with full-resolution photos and IDs.</p>
+    <div class="export-grid">
+      <button class="chip" data-min="2">Last 2 min</button>
+      <button class="chip" data-min="5">Last 5 min</button>
+      <button class="chip" data-min="10">Last 10 min</button>
+      <button class="chip" data-min="20">Last 20 min</button>
+      <button class="chip" data-min="30">Last 30 min</button>
+      <button class="chip" data-min="60">Last 1 hour</button>
+      <button class="chip" data-min="360">Last 6 hours</button>
+      <button class="chip" data-min="720">Last 12 hours</button>
+      <button class="chip wide" data-min="all">Entire chat</button>
+    </div>
+    <button class="sheet-item cancel" data-act="cancel">Close</button>
+  </div>
+</div>
+
+<!-- Room info sheet -->
+<div class="sheet-backdrop" id="info-sheet" hidden>
+  <div class="sheet">
+    <div class="sheet-handle"></div>
+    <div class="sheet-title" id="info-title"></div>
+    <div class="invite">
+      <div>Room code <b id="info-code"></b></div>
+      <button class="btn small" id="share-btn">Share invite</button>
+    </div>
+    <div class="sheet-sub">Members</div>
+    <ul class="members" id="members"></ul>
+    <button class="sheet-item cancel" data-act="cancel">Close</button>
+  </div>
+</div>
+
+<!-- Photo viewer -->
+<div class="lightbox" id="lightbox" hidden>
+  <div class="lb-top">
+    <button class="icon-btn light" id="lb-close" aria-label="Close">✕</button>
+    <div class="lb-title"><b id="lb-uid"></b><span id="lb-by"></span></div>
+    <a class="icon-btn light" id="lb-download" aria-label="Download original" download>
+      <svg viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
+    </a>
+  </div>
+  <div class="lb-stage"><img id="lb-img" alt=""></div>
+  <div class="lb-bottom">
+    <div id="lb-desc" class="lb-desc"></div>
+    <button class="btn primary" id="lb-describe">Describe this photo</button>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="/render.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>
