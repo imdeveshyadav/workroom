@@ -1,17 +1,14 @@
-/* Commetty Book — keep a record of every commetty (chit / BC) installment, fully offline.
-   Data lives in IndexedDB on the phone; backups are a single file you share to WhatsApp/Drive
-   and restore with one tap. */
+/* Commetty Book — keep a record of every commetty (chit / BC) installment.
+   Data lives on your own server; the server backs it up every night. The last loaded data is
+   cached by the service worker so the app still opens (read-only) without internet. */
 'use strict';
 
-const APP_ID = 'commetty-book';
-const BACKUP_VERSION = 1;
 const MODES = ['PhonePe', 'Google Pay', 'Paytm', 'UPI (other)', 'Cash', 'Bank transfer', 'Other'];
-const DEFAULT_SETTINGS = { autoPrompt: true, autoDownload: false, remindDays: 7 };
 
 const $ = (s, el = document) => el.querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const inr = (n) => '₹' + Number(n || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 });
-const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+const shotUrl = (id) => `api/shots/${id}`;
 
 // ------------------------------------------------------------------ dates (stored as YYYY-MM-DD)
 const pad = (n) => String(n).padStart(2, '0');
@@ -29,15 +26,34 @@ function addMonths(iso, n) {
   return toISO(t);
 }
 
+// ------------------------------------------------------------------ server API
+class LoginRequired extends Error {}
+
+async function api(method, url, body) {
+  const headers = { 'X-CB': '1' };
+  if (body instanceof Blob) headers['Content-Type'] = body.type || 'application/octet-stream';
+  else if (body !== undefined) { headers['Content-Type'] = 'application/json'; body = JSON.stringify(body); }
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body, credentials: 'same-origin' });
+  } catch {
+    throw new Error('Internet / server se connect nahi ho paya');
+  }
+  if (res.headers.get('X-Offline')) S.offline = true;
+  const data = (res.headers.get('Content-Type') || '').includes('json') ? await res.json() : null;
+  if (res.status === 401 && url !== 'api/login') throw new LoginRequired();
+  if (!res.ok) throw new Error(data?.error || `Error ${res.status}`);
+  return data;
+}
+
 // ------------------------------------------------------------------ state
-const S = { committees: [], deposits: [], settings: { ...DEFAULT_SETTINGS }, lastBackupAt: null, changes: 0 };
+const S = { committees: [], deposits: [], server: {}, offline: false, loggedIn: false };
 
 async function loadState() {
-  const [committees, deposits, settings, lastBackupAt, changes] = await Promise.all([
-    DB.all('committees'), DB.all('deposits'), DB.get('meta', 'settings'), DB.get('meta', 'lastBackupAt'), DB.get('meta', 'changes'),
-  ]);
-  committees.sort((a, b) => (b.startDate || '').localeCompare(a.startDate || ''));
-  Object.assign(S, { committees, deposits, settings: { ...DEFAULT_SETTINGS, ...settings }, lastBackupAt: lastBackupAt || null, changes: changes || 0 });
+  S.offline = false;
+  const d = await api('GET', 'api/data');
+  d.committees.sort((a, b) => (b.startDate || '').localeCompare(a.startDate || ''));
+  Object.assign(S, { committees: d.committees, deposits: d.deposits, server: d.server || {}, loggedIn: true });
 }
 
 const committee = (id) => S.committees.find((c) => c.id === id);
@@ -66,31 +82,28 @@ function dueLabel(st) {
   return { text: `Due in ${st.daysLeft} days`, cls: 'ok' };
 }
 
-// Every save goes through here: counts unsaved changes, optionally auto-downloads a backup
-// and offers a one-tap WhatsApp backup.
-async function afterChange(kind) {
-  S.changes += 1;
-  await DB.put('meta', S.changes, 'changes');
-  await loadState();
-  if (S.settings.autoDownload) await downloadBackup(true);
-  if (S.settings.autoPrompt && kind === 'deposit') {
-    toast('Deposit saved ✔', { label: 'Backup bhejo', fn: shareBackup }, 7000);
-  } else {
-    toast('Saved ✔');
+// Runs a write, then reloads data. Errors become a toast; an expired session shows the login screen.
+async function save(fn, okMsg = 'Saved ✔') {
+  if (S.offline) { toast('Offline hai — internet aane par save karein'); return false; }
+  try {
+    await fn();
+    await loadState();
+    if (okMsg) toast(okMsg);
+    return true;
+  } catch (err) {
+    if (err instanceof LoginRequired) { viewLogin(); return false; }
+    toast(err.message);
+    return false;
   }
 }
-
-const backupDue = () => S.committees.length > 0 && S.changes > 0 && (!S.lastBackupAt
-  || (Date.now() - new Date(S.lastBackupAt)) / 86400000 >= S.settings.remindDays || S.changes >= 5);
 
 // ------------------------------------------------------------------ UI helpers
 const app = $('#app');
 let toastTimer;
-function toast(msg, action, ms = 2600) {
+function toast(msg, ms = 2800) {
   const el = $('#toast');
-  el.innerHTML = `<span>${esc(msg)}</span>${action ? `<button type="button">${esc(action.label)}</button>` : ''}`;
+  el.innerHTML = `<span>${esc(msg)}</span>`;
   el.hidden = false;
-  if (action) el.querySelector('button').onclick = () => { el.hidden = true; action.fn(); };
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.hidden = true; }, ms);
 }
@@ -109,6 +122,7 @@ function ask(html, buttons) {
     dlg.showModal();
   });
 }
+const confirmBox = (html, label, cls = '') => ask(html, [{ label: 'Cancel', cls: 'ghost', value: false }, { label, cls, value: true }]);
 
 function viewImage(src) {
   const v = $('#viewer');
@@ -128,7 +142,8 @@ const ICON = {
 function bar(title, { back, actions = '' } = {}) {
   return `<header class="bar">
     ${back ? `<a class="icon-btn" href="${back}" aria-label="Back">${ICON.back}</a>` : '<span class="logo"><img src="icons/icon.svg" alt=""></span>'}
-    <h1>${esc(title)}</h1>${actions}</header>`;
+    <h1>${esc(title)}</h1>${actions}</header>
+    ${S.offline ? '<div class="offline">📴 Offline — purana data dikh raha hai, abhi kuch save nahi hoga</div>' : ''}`;
 }
 
 // ------------------------------------------------------------------ router
@@ -137,7 +152,8 @@ window.addEventListener('hashchange', route);
 function go(hash) {
   if (location.hash === hash) route(); else location.replace(hash);
 }
-async function route() {
+function route() {
+  if (!S.loggedIn) return viewLogin();
   const p = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
   window.scrollTo(0, 0);
   if (p[0] === 'new') return viewCommitteeForm(null);
@@ -152,6 +168,32 @@ async function route() {
     if (d) return viewDepositForm(committee(d.committeeId), d);
   }
   return viewHome();
+}
+
+// ------------------------------------------------------------------ login
+function viewLogin() {
+  S.loggedIn = false;
+  app.innerHTML = `<main class="login">
+    <img src="icons/icon.svg" alt="">
+    <h1>Commetty Book</h1>
+    <form class="card form" id="lform">
+      <label>Password<input name="password" type="password" autocomplete="current-password" required autofocus></label>
+      <button class="btn block" type="submit">Login</button>
+      <p class="small muted" id="lerr" role="alert"></p>
+    </form></main>`;
+  $('#lform').onsubmit = async (e) => {
+    e.preventDefault();
+    const btn = e.target.querySelector('button');
+    btn.disabled = true;
+    try {
+      await api('POST', 'api/login', { password: e.target.password.value });
+      await loadState();
+      route();
+    } catch (err) {
+      $('#lerr').textContent = err.message;
+      btn.disabled = false;
+    }
+  };
 }
 
 // ------------------------------------------------------------------ home
@@ -172,14 +214,8 @@ function viewHome() {
     </a>`;
   }).join('');
 
-  const banner = backupDue() ? `<div class="banner">
-      <div><b>${S.changes} change${S.changes === 1 ? '' : 's'} ka backup baaki hai</b>
-      <div class="small">${S.lastBackupAt ? 'Last backup ' + fmtDateTime(S.lastBackupAt) : 'Abhi tak koi backup nahi liya'}</div></div>
-      <button type="button" class="btn small-btn" data-act="share-backup">Backup now</button></div>` : '';
-
   app.innerHTML = `${bar('Commetty Book', { actions: `<a class="icon-btn" href="#/backup" aria-label="Backup & restore">${ICON.backup}</a>` })}
     <main>
-      ${banner}
       ${S.committees.length ? `<div class="totals"><div><span>${S.committees.length}</span>Commetty</div><div><span>${S.deposits.length}</span>Deposits</div><div><span>${inr(totalPaid)}</span>Total jama</div></div>
         ${cards}` : `<div class="empty"><img src="icons/icon.svg" alt="">
         <h2>Koi commetty nahi hai</h2><p>Apni pehli commetty add karein — naam, total amount aur start date.</p>
@@ -207,7 +243,7 @@ function viewCommittee(c, tab) {
             ${d.paidTo ? `<span>Paid to</span><b>${esc(d.paidTo)}</b>` : ''}
             ${d.note ? `<span>Note</span><b>${esc(d.note)}</b>` : ''}
           </div>
-          ${d.screenshots?.length ? `<div class="shots">${d.screenshots.map((s, i) => `<img src="${s}" alt="Screenshot ${i + 1}" data-view>`).join('')}</div>` : ''}
+          ${d.screenshots?.length ? `<div class="shots">${d.screenshots.map((s, i) => `<img src="${shotUrl(s)}" alt="Screenshot ${i + 1}" loading="lazy" data-view>`).join('')}</div>` : ''}
         </div>`).join('');
 
   app.innerHTML = `${bar(c.name, { back: '#/', actions: `<button type="button" class="icon-btn" data-act="share-summary" aria-label="Share summary">${ICON.share}</button><a class="icon-btn" href="#/c/${c.id}/edit" aria-label="Edit">${ICON.edit}</a>` })}
@@ -262,18 +298,18 @@ function viewCommitteeForm(c) {
   const v = c || { startDate: todayISO() };
   app.innerHTML = `${bar(c ? 'Edit commetty' : 'Nayi commetty', { back: c ? `#/c/${c.id}` : '#/' })}
     <main><form class="card form" id="cform" autocomplete="off">
-      <label>Commetty name *<input name="name" required value="${esc(v.name)}" placeholder="e.g. Santosh uncle January 2026"></label>
+      <label>Commetty name *<input name="name" required maxlength="200" value="${esc(v.name)}" placeholder="e.g. Santosh uncle January 2026"></label>
       <label>Commetty total amount (₹) *<input name="totalAmount" type="number" inputmode="decimal" min="0" step="any" required value="${esc(v.totalAmount)}" placeholder="105000"></label>
       <label>Commetty started date *<input name="startDate" type="date" required value="${esc(v.startDate)}"></label>
       <div class="grid2">
-        <label>Monthly installment (₹)<input name="monthly" type="number" inputmode="decimal" min="0" step="any" value="${esc(v.monthly)}" placeholder="7000"></label>
-        <label>Total installments<input name="months" type="number" inputmode="numeric" min="0" step="1" value="${esc(v.months)}" placeholder="15"></label>
+        <label>Monthly installment (₹)<input name="monthly" type="number" inputmode="decimal" min="0" step="any" value="${esc(v.monthly || '')}" placeholder="7000"></label>
+        <label>Total installments<input name="months" type="number" inputmode="numeric" min="0" max="1000" step="1" value="${esc(v.months || '')}" placeholder="15"></label>
       </div>
-      <label>Organizer / head<input name="organizer" value="${esc(v.organizer)}" placeholder="Santosh uncle"></label>
-      <label>Notes<textarea name="notes" rows="2" placeholder="Members, rules, bid details…">${esc(v.notes)}</textarea></label>
+      <label>Organizer / head<input name="organizer" maxlength="200" value="${esc(v.organizer)}" placeholder="Santosh uncle"></label>
+      <label>Notes<textarea name="notes" rows="2" maxlength="4000" placeholder="Members, rules, bid details…">${esc(v.notes)}</textarea></label>
       <details ${v.receivedAmount ? 'open' : ''}><summary>Commetty uthayi? (payout received)</summary>
         <div class="grid2">
-          <label>Amount received (₹)<input name="receivedAmount" type="number" inputmode="decimal" min="0" step="any" value="${esc(v.receivedAmount)}"></label>
+          <label>Amount received (₹)<input name="receivedAmount" type="number" inputmode="decimal" min="0" step="any" value="${esc(v.receivedAmount || '')}"></label>
           <label>Received on<input name="receivedDate" type="date" value="${esc(v.receivedDate)}"></label>
         </div></details>
       <p class="small muted">Har installment ki due date start date ke hisaab se nikalti hai (start 5 Jan → #2 due 5 Feb, #3 due 5 Mar…).</p>
@@ -284,20 +320,17 @@ function viewCommitteeForm(c) {
   $('#cform').onsubmit = async (e) => {
     e.preventDefault();
     const f = Object.fromEntries(new FormData(e.target));
-    const num = (x) => (x === '' ? null : Number(x));
     const rec = {
-      ...(c || { id: uid(), createdAt: new Date().toISOString() }),
-      name: f.name.trim(), totalAmount: num(f.totalAmount), startDate: f.startDate, monthly: num(f.monthly), months: num(f.months),
-      organizer: f.organizer.trim(), notes: f.notes.trim(), receivedAmount: num(f.receivedAmount), receivedDate: f.receivedDate || null,
-      updatedAt: new Date().toISOString(),
+      name: f.name, totalAmount: Number(f.totalAmount), startDate: f.startDate, monthly: Number(f.monthly) || 0, months: Number(f.months) || 0,
+      organizer: f.organizer, notes: f.notes, receivedAmount: Number(f.receivedAmount) || 0, receivedDate: f.receivedDate || '',
     };
-    await DB.put('committees', rec);
-    await afterChange('committee');
-    go(`#/c/${rec.id}`);
+    let saved;
+    if (await save(async () => { saved = await (c ? api('PUT', `api/committees/${c.id}`, rec) : api('POST', 'api/committees', rec)); })) go(`#/c/${saved.id}`);
   };
 }
 
 // ------------------------------------------------------------------ deposit form
+// Screenshots are shrunk on the phone (max 1600px JPEG) before upload, so the server does no image work.
 async function compressImage(file, max = 1600, quality = 0.8) {
   try {
     const bmp = await createImageBitmap(file);
@@ -305,9 +338,9 @@ async function compressImage(file, max = 1600, quality = 0.8) {
     const cv = document.createElement('canvas');
     cv.width = Math.round(bmp.width * s); cv.height = Math.round(bmp.height * s);
     cv.getContext('2d').drawImage(bmp, 0, 0, cv.width, cv.height);
-    return cv.toDataURL('image/jpeg', quality);
+    return await new Promise((resolve) => cv.toBlob(resolve, 'image/jpeg', quality));
   } catch {
-    return new Promise((resolve, reject) => { const r = new FileReader(); r.onload = () => resolve(r.result); r.onerror = reject; r.readAsDataURL(file); });
+    return file;
   }
 }
 
@@ -315,242 +348,197 @@ function viewDepositForm(c, d) {
   const st = stats(c);
   const prev = st.deps[st.deps.length - 1];
   const v = d || { installmentNo: st.nextNo, amount: c.monthly || prev?.amount || '', date: todayISO(), mode: prev?.mode || 'PhonePe', paidTo: prev?.paidTo || c.organizer || '' };
-  let shots = [...(v.screenshots || [])];
+  const shots = [...(v.screenshots || [])];
 
   app.innerHTML = `${bar(d ? 'Edit deposit' : 'Add deposit', { back: `#/c/${c.id}` })}
     <main><div class="muted small pad">${esc(c.name)}${d ? '' : ` · next due ${fmtDate(st.nextDue)}`}</div>
     <form class="card form" id="dform" autocomplete="off">
       <div class="grid2">
-        <label>Installment no. *<input name="installmentNo" type="number" inputmode="numeric" min="1" step="1" required value="${esc(v.installmentNo)}"></label>
+        <label>Installment no. *<input name="installmentNo" type="number" inputmode="numeric" min="1" max="1000" step="1" required value="${esc(v.installmentNo)}"></label>
         <label>Amount (₹) *<input name="amount" type="number" inputmode="decimal" min="0" step="any" required value="${esc(v.amount)}"></label>
       </div>
       <label>Paid on *<input name="date" type="date" required value="${esc(v.date)}"></label>
       <fieldset><legend>Paid via</legend><div class="chips">${MODES.map((m) =>
         `<label class="chip"><input type="radio" name="mode" value="${esc(m)}" ${v.mode === m ? 'checked' : ''}><span>${esc(m)}</span></label>`).join('')}</div></fieldset>
-      <label>Transaction ID / UTR<input name="txnId" value="${esc(v.txnId)}" placeholder="e.g. T2601051234…"></label>
-      <label>Paid to<input name="paidTo" value="${esc(v.paidTo)}" placeholder="Name / UPI ID"></label>
-      <label>Note<textarea name="note" rows="2" placeholder="Bid, late fee, kisne liya…">${esc(v.note)}</textarea></label>
+      <label>Transaction ID / UTR<input name="txnId" maxlength="100" value="${esc(v.txnId)}" placeholder="e.g. T2601051234…"></label>
+      <label>Paid to<input name="paidTo" maxlength="200" value="${esc(v.paidTo)}" placeholder="Name / UPI ID"></label>
+      <label>Note<textarea name="note" rows="2" maxlength="4000" placeholder="Bid, late fee, kisne liya…">${esc(v.note)}</textarea></label>
       <fieldset><legend>Payment screenshot</legend>
         <div class="shots edit" id="shots"></div>
-        <label class="btn ghost block">📷 Screenshot / photo add karein<input id="shotInput" type="file" accept="image/*" multiple hidden></label>
+        <label class="btn ghost block" id="shotBtn">📷 Screenshot / photo add karein<input id="shotInput" type="file" accept="image/*" multiple hidden></label>
       </fieldset>
       <button class="btn block" type="submit">${d ? 'Save changes' : 'Save deposit'}</button>
       ${d ? '<button class="btn danger block" type="button" data-act="del-deposit">Delete deposit</button>' : ''}
     </form></main>`;
 
   const drawShots = () => {
-    $('#shots').innerHTML = shots.map((s, i) => `<div class="shot"><img src="${s}" alt="" data-view><button type="button" data-rm="${i}" aria-label="Remove">✕</button></div>`).join('');
+    $('#shots').innerHTML = shots.map((s, i) => `<div class="shot"><img src="${shotUrl(s)}" alt="" data-view><button type="button" data-rm="${i}" aria-label="Remove">✕</button></div>`).join('');
   };
   drawShots();
   $('#shots').onclick = (e) => { const b = e.target.closest('[data-rm]'); if (b) { shots.splice(Number(b.dataset.rm), 1); drawShots(); } };
+  let uploading = 0;
   $('#shotInput').onchange = async (e) => {
-    for (const f of e.target.files) shots.push(await compressImage(f));
+    const files = [...e.target.files];
     e.target.value = '';
-    drawShots();
+    $('#shotBtn').firstChild.textContent = '⏳ Upload ho raha hai… ';
+    uploading++;
+    try {
+      for (const f of files) shots.push((await api('POST', 'api/shots', await compressImage(f))).id);
+    } catch (err) {
+      if (err instanceof LoginRequired) return viewLogin();
+      toast(err.message);
+    } finally {
+      uploading--;
+      if ($('#shotBtn')) $('#shotBtn').firstChild.textContent = '📷 Screenshot / photo add karein';
+    }
+    if ($('#shots')) drawShots();
   };
 
   $('#dform').onsubmit = async (e) => {
     e.preventDefault();
+    if (uploading) return toast('Screenshot upload hone dein…');
     const f = Object.fromEntries(new FormData(e.target));
     const rec = {
-      ...(d || { id: uid(), committeeId: c.id, createdAt: new Date().toISOString() }),
-      installmentNo: Number(f.installmentNo), amount: Number(f.amount), date: f.date, mode: f.mode || '',
-      txnId: f.txnId.trim(), paidTo: f.paidTo.trim(), note: f.note.trim(), screenshots: shots, updatedAt: new Date().toISOString(),
+      committeeId: c.id, installmentNo: Number(f.installmentNo), amount: Number(f.amount), date: f.date, mode: f.mode || '',
+      txnId: f.txnId, paidTo: f.paidTo, note: f.note, screenshots: shots,
     };
     const dup = !d && S.deposits.some((x) => x.committeeId === c.id && x.installmentNo === rec.installmentNo);
-    if (dup && !(await ask(`<p>Installment <b>#${rec.installmentNo}</b> ka deposit pehle se hai. Phir bhi ek aur add karein? (e.g. part payment)</p>`,
-      [{ label: 'Cancel', cls: 'ghost', value: false }, { label: 'Add anyway', value: true }]))) return;
-    await DB.put('deposits', rec);
-    await afterChange('deposit');
-    go(`#/c/${c.id}/history`);
+    if (dup && !(await confirmBox(`<p>Installment <b>#${rec.installmentNo}</b> ka deposit pehle se hai. Phir bhi ek aur add karein? (e.g. part payment)</p>`, 'Add anyway'))) return;
+    if (await save(() => (d ? api('PUT', `api/deposits/${d.id}`, rec) : api('POST', 'api/deposits', rec)), 'Deposit saved ✔')) go(`#/c/${c.id}/history`);
   };
   app.dataset.deposit = d ? d.id : '';
   app.dataset.committee = c.id;
 }
 
 // ------------------------------------------------------------------ backup & restore
-async function buildBackup() {
-  const [committees, deposits] = await Promise.all([DB.all('committees'), DB.all('deposits')]);
-  return { app: APP_ID, version: BACKUP_VERSION, exportedAt: new Date().toISOString(), committees, deposits };
-}
-function backupName(ext) {
-  const d = new Date();
-  return `CommettyBackup_${toISO(d)}_${pad(d.getHours())}${pad(d.getMinutes())}.${ext}`;
-}
-async function markBackedUp() {
-  S.lastBackupAt = new Date().toISOString(); S.changes = 0;
-  await Promise.all([DB.put('meta', S.lastBackupAt, 'lastBackupAt'), DB.put('meta', 0, 'changes')]);
-}
 function downloadBlob(blob, name) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
-async function downloadBackup(silent) {
-  downloadBlob(new Blob([JSON.stringify(await buildBackup())], { type: 'application/json' }), backupName('json'));
-  await markBackedUp();
-  if (!silent) { toast('Backup file Downloads me save ho gayi ✔'); route(); }
-}
 
-// Android's share sheet (WhatsApp, Drive, Gmail, Telegram…). Chrome only allows sharing certain
-// file types, so the JSON backup is shared as a .txt file — restore accepts both .txt and .json.
-async function shareBackup() {
-  const file = new File([JSON.stringify(await buildBackup())], backupName('txt'), { type: 'text/plain' });
-  if (navigator.canShare?.({ files: [file] })) {
-    try {
-      await navigator.share({ files: [file], title: 'Commetty Book backup' });
-      await markBackedUp();
-      toast('Backup shared ✔');
-      route();
-    } catch (err) {
-      if (err.name !== 'AbortError') { toast('Share nahi hua, file download kar rahe hain'); await downloadBackup(true); route(); }
-    }
-  } else {
-    await downloadBackup();
-  }
-}
-
-async function shareCsv() {
+function exportCsv() {
   const q = (s) => `"${String(s ?? '').replace(/"/g, '""')}"`;
   const rows = [['Commetty', 'Total amount', 'Started', 'Installment', 'Amount', 'Date', 'Paid via', 'Txn/UTR', 'Paid to', 'Note', 'Screenshots']];
   for (const c of S.committees) for (const d of depositsOf(c.id)) {
     rows.push([c.name, c.totalAmount, c.startDate, d.installmentNo, d.amount, d.date, d.mode, d.txnId, d.paidTo, d.note, d.screenshots?.length || 0]);
   }
-  const csv = '﻿' + rows.map((r) => r.map(q).join(',')).join('\r\n');
-  const file = new File([csv], backupName('csv').replace('Backup', 'Deposits'), { type: 'text/csv' });
-  if (navigator.canShare?.({ files: [file] })) {
-    try { await navigator.share({ files: [file], title: 'Commetty deposits' }); } catch (err) { if (err.name !== 'AbortError') downloadBlob(file, file.name); }
-  } else downloadBlob(file, file.name);
+  downloadBlob(new Blob(['﻿' + rows.map((r) => r.map(q).join(',')).join('\r\n')], { type: 'text/csv' }), `CommettyDeposits_${todayISO()}.csv`);
 }
 
-function validBackup(data) {
-  return data && data.app === APP_ID && Array.isArray(data.committees) && Array.isArray(data.deposits)
-    && data.committees.every((c) => c && typeof c.id === 'string' && c.name)
-    && data.deposits.every((d) => d && typeof d.id === 'string' && typeof d.committeeId === 'string');
-}
+const fmtSize = (n) => (n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB');
+const backupLabel = (name) => ({ auto: 'Daily auto', manual: 'Manual', prerestore: 'Restore se pehle' }[name.replace(/^.*-(\w+)\.zip$/, '$1')] || '');
 
-async function restoreFromFile(file) {
-  let data;
-  try { data = JSON.parse(await file.text()); } catch { data = null; }
-  if (!validBackup(data)) {
-    await ask('<p>Ye Commetty Book ki backup file nahi lag rahi. Sahi file (<b>CommettyBackup_….txt / .json</b>) choose karein.</p>', [{ label: 'OK', value: true }]);
-    return;
-  }
-  const choice = await ask(`<h3>Restore backup?</h3>
-    <p>Backup date: <b>${data.exportedAt ? fmtDateTime(data.exportedAt) : 'unknown'}</b><br>
-    ${data.committees.length} commetty · ${data.deposits.length} deposits</p>
-    <p class="small"><b>Replace</b>: phone ka abhi ka data hata kar backup wala data aa jayega.<br>
-    <b>Merge</b>: dono mila diye jayenge (same entry backup se update hogi).</p>`,
-  [{ label: 'Cancel', cls: 'ghost', value: null }, { label: 'Merge', cls: 'ghost', value: 'merge' }, { label: 'Replace', value: 'replace' }]);
-  if (!choice) return;
-  // Keep what was on the phone so a wrong restore can be undone.
-  await DB.put('meta', await buildBackup(), 'preRestore');
-  await DB.load(data.committees, data.deposits, choice === 'replace');
-  await markBackedUp();
-  await loadState();
-  toast('Restore ho gaya ✔');
-  go('#/');
-}
-
-async function undoRestore() {
-  const prev = await DB.get('meta', 'preRestore');
-  if (!prev) return;
-  if (!(await ask('<p>Restore se pehle wala data wapas laayein?</p>', [{ label: 'Cancel', cls: 'ghost', value: false }, { label: 'Undo restore', value: true }]))) return;
-  await DB.load(prev.committees, prev.deposits, true);
-  await DB.del('meta', 'preRestore');
-  await afterChange('restore');
-  route();
+async function restoreConfirmed(what) {
+  return confirmBox(`<h3>Restore karein?</h3><p>${what}</p>
+    <p class="small">Abhi ka saara data is backup se <b>replace</b> ho jayega. Abhi wale data ka backup pehle apne aap ban jayega (“Restore se pehle”), to galti hone par wapas la sakte hain.</p>`, 'Restore');
 }
 
 async function viewBackup() {
-  const persisted = await navigator.storage?.persisted?.();
-  const est = await navigator.storage?.estimate?.().catch(() => null);
-  const hasUndo = !!(await DB.get('meta', 'preRestore'));
-  const s = S.settings;
+  const sv = S.server;
+  let list = [];
+  try { list = await api('GET', 'api/backups'); } catch (err) { if (err instanceof LoginRequired) return viewLogin(); }
+  if (!location.hash.startsWith('#/backup')) return;
   app.innerHTML = `${bar('Backup & restore', { back: '#/' })}
     <main>
       <div class="card">
-        <h3>Backup</h3>
-        <p class="small muted">${S.lastBackupAt ? `Last backup: <b>${fmtDateTime(S.lastBackupAt)}</b>` : 'Abhi tak koi backup nahi liya.'}
-        ${S.changes ? `<br><b>${S.changes}</b> change${S.changes === 1 ? '' : 's'} backup ke baad.` : ''}</p>
-        <button type="button" class="btn block" data-act="share-backup">${ICON.share} WhatsApp / Drive par backup bhejo</button>
-        <button type="button" class="btn ghost block" data-act="download-backup">⬇ Backup file phone me save karo</button>
-        <p class="small muted">Tip: WhatsApp par apne aap ko (“Message yourself”) ya family group me bhejein. Puri details + screenshots ek hi file me hoti hain.</p>
+        <h3>Automatic backup ✔</h3>
+        <p class="small muted">Server roz raat <b>${pad(sv.backupHour ?? 2)}:00</b> baje backup leta hai (agar kuch badla ho) aur aakhri <b>${sv.backupKeep ?? 30}</b> backups rakhta hai.
+        ${sv.telegram ? '<br>📨 Har backup <b>Telegram</b> par bhi bheja jata hai.' : '<br>Telegram off hai — server ke <code>TELEGRAM_BOT_TOKEN</code> set karke off-site copy pa sakte hain.'}</p>
+        <p class="small">${sv.lastBackup ? `Last backup: <b>${fmtDateTime(sv.lastBackup.time)}</b>` : 'Abhi tak koi backup nahi.'}${sv.pending ? ' · <span class="pill warn">naye changes baaki</span>' : ''}</p>
+        <button type="button" class="btn block" data-act="backup-now">☁ Abhi backup lo${sv.telegram ? ' + Telegram' : ''}</button>
+        <a class="btn ghost block" href="api/backup" download>⬇ Poora backup phone me download karo (.zip)</a>
       </div>
       <div class="card">
-        <h3>Restore (one tap)</h3>
-        <p class="small muted">WhatsApp se backup file download karke yahan choose karein.</p>
-        <label class="btn block">📂 Backup file choose karo<input id="restoreInput" type="file" accept=".txt,.json,text/plain,application/json" hidden></label>
-        ${hasUndo ? '<button type="button" class="btn ghost block" data-act="undo-restore">↩ Undo last restore</button>' : ''}
+        <h3>Server par saved backups</h3>
+        ${list.length ? `<div class="blist">${list.map((b) => `<div class="bi">
+          <div><b>${fmtDateTime(b.time)}</b><span class="small muted">${backupLabel(b.name)} · ${fmtSize(b.size)}</span></div>
+          <a class="icon-btn sm" href="api/backups/${b.name}" download aria-label="Download">⬇</a>
+          <button type="button" class="btn ghost mini" data-restore="${b.name}">Restore</button></div>`).join('')}</div>`
+          : '<p class="small muted">Koi backup nahi.</p>'}
       </div>
-      <div class="card form">
-        <h3>Auto backup settings</h3>
-        <label class="switch"><input type="checkbox" data-set="autoPrompt" ${s.autoPrompt ? 'checked' : ''}><span>Har deposit ke baad “Backup bhejo” button dikhao</span></label>
-        <label class="switch"><input type="checkbox" data-set="autoDownload" ${s.autoDownload ? 'checked' : ''}><span>Har change par backup file apne aap Downloads me save karo</span></label>
-        <label>Backup reminder (home screen par)
-          <select data-set="remindDays">${[1, 3, 7, 15, 30].map((n) => `<option value="${n}" ${s.remindDays === n ? 'selected' : ''}>Har ${n} din</option>`).join('')}</select></label>
+      <div class="card">
+        <h3>File se restore</h3>
+        <p class="small muted">Phone me rakhi backup .zip file (ya Telegram se download ki hui) choose karein.</p>
+        <label class="btn block">📂 Backup .zip choose karo<input id="restoreInput" type="file" accept=".zip,application/zip" hidden></label>
       </div>
       <div class="card">
         <h3>Export</h3>
-        <button type="button" class="btn ghost block" data-act="share-csv">📊 Excel / Sheets (CSV) export</button>
+        <button type="button" class="btn ghost block" data-act="export-csv">📊 Excel / Sheets (CSV) export</button>
       </div>
-      <div class="card small muted">
-        <b>Phone storage:</b> ${persisted ? '✔ Protected (browser khud data delete nahi karega)' : '⚠ Not protected — app ko Home screen par install karein'}
-        ${est ? `<br>Used: ${(est.usage / 1048576).toFixed(1)} MB` : ''}
-        <br>Data sirf is phone ke browser me hai. “Clear data” / app uninstall karne se pehle backup zaroor lein.
-      </div>
+      <button type="button" class="btn danger block" data-act="logout">Logout</button>
     </main>`;
 
-  $('#restoreInput').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) restoreFromFile(f); };
-  app.querySelectorAll('[data-set]').forEach((el) => {
-    el.onchange = async () => {
-      S.settings[el.dataset.set] = el.type === 'checkbox' ? el.checked : Number(el.value);
-      await DB.put('meta', S.settings, 'settings');
-      toast('Setting saved');
-    };
-  });
+  $('#restoreInput').onchange = async (e) => {
+    const f = e.target.files[0];
+    e.target.value = '';
+    if (!f || !(await restoreConfirmed(`File: <b>${esc(f.name)}</b> (${fmtSize(f.size)})`))) return;
+    toast('Restore ho raha hai…', 60000);
+    if (await save(() => api('POST', 'api/restore', f), 'Restore ho gaya ✔')) go('#/');
+  };
 }
 
 // ------------------------------------------------------------------ global actions
 app.addEventListener('click', async (e) => {
   const img = e.target.closest('img[data-view]');
   if (img) return viewImage(img.src);
+  const rb = e.target.closest('[data-restore]');
+  if (rb) {
+    if (!(await restoreConfirmed(`Backup: <b>${esc(rb.closest('.bi').querySelector('b').textContent)}</b>`))) return;
+    if (await save(() => api('POST', `api/backups/${rb.dataset.restore}/restore`), 'Restore ho gaya ✔')) go('#/');
+    return;
+  }
   const el = e.target.closest('[data-act]');
   if (!el) return;
   const act = el.dataset.act;
-  if (act === 'share-backup') return shareBackup();
-  if (act === 'download-backup') return downloadBackup();
-  if (act === 'share-csv') return shareCsv();
-  if (act === 'undo-restore') return undoRestore();
+  if (act === 'reload') return location.reload();
+  if (act === 'export-csv') return exportCsv();
+  if (act === 'backup-now') {
+    el.disabled = true;
+    let r;
+    if (await save(async () => { r = await api('POST', 'api/backups'); }, null)) {
+      toast(r.telegramError ? 'Backup bana, par Telegram fail: ' + r.telegramError : r.telegram ? 'Backup bana aur Telegram par bheja ✔' : 'Backup ban gaya ✔', 4000);
+      viewBackup();
+    } else el.disabled = false;
+    return;
+  }
+  if (act === 'logout') {
+    if (!(await confirmBox('<p>Is phone se logout karein?</p>', 'Logout'))) return;
+    await api('POST', 'api/logout').catch(() => {});
+    await caches.delete('commetty-data').catch(() => {});
+    Object.assign(S, { committees: [], deposits: [], loggedIn: false });
+    location.hash = '';
+    return viewLogin();
+  }
   if (act === 'share-summary') {
     const text = summaryText(committee(app.dataset.committee));
     if (navigator.share) navigator.share({ text }).catch(() => {});
-    else window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank');
+    else window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
     return;
   }
   if (act === 'del-committee') {
     const c = committee(app.dataset.committee);
     const n = depositsOf(c.id).length;
-    if (!(await ask(`<p><b>${esc(c.name)}</b> aur uske ${n} deposit${n === 1 ? '' : 's'} delete karein? Ye wapas nahi aayega (backup ho to restore kar sakte hain).</p>`,
-      [{ label: 'Cancel', cls: 'ghost', value: false }, { label: 'Delete', cls: 'danger', value: true }]))) return;
-    await DB.deleteCommittee(c.id);
-    await afterChange('delete');
-    go('#/');
+    if (!(await confirmBox(`<p><b>${esc(c.name)}</b> aur uske ${n} deposit${n === 1 ? '' : 's'} delete karein? (Purane backup se wapas la sakte hain.)</p>`, 'Delete', 'danger'))) return;
+    if (await save(() => api('DELETE', `api/committees/${c.id}`), 'Deleted')) go('#/');
   }
   if (act === 'del-deposit') {
-    if (!(await ask('<p>Ye deposit delete karein?</p>', [{ label: 'Cancel', cls: 'ghost', value: false }, { label: 'Delete', cls: 'danger', value: true }]))) return;
-    await DB.del('deposits', app.dataset.deposit);
-    await afterChange('delete');
-    go(`#/c/${app.dataset.committee}/history`);
+    if (!(await confirmBox('<p>Ye deposit delete karein?</p>', 'Delete', 'danger'))) return;
+    if (await save(() => api('DELETE', `api/deposits/${app.dataset.deposit}`), 'Deleted')) go(`#/c/${app.dataset.committee}/history`);
   }
 });
 
 // ------------------------------------------------------------------ start
 (async () => {
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-  // Ask the browser not to evict our data when the phone is low on space.
-  navigator.storage?.persist?.().catch(() => {});
-  await loadState();
+  try {
+    await loadState();
+  } catch (err) {
+    if (!(err instanceof LoginRequired)) {
+      app.innerHTML = `<main class="empty"><h2>Server se connect nahi ho paya</h2><p>${esc(err.message)}</p><button class="btn" type="button" data-act="reload">Retry</button></main>`;
+      return;
+    }
+  }
   route();
 })();

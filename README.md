@@ -2,7 +2,7 @@
 
 A mobile-first **PWA for work-group messaging** where every member of a workroom sees every message and photo, photos are kept at **full resolution**, every message carries a **unique ID**, and anyone can **export the chat in one tap**.
 
-> Also in this repo: **[Commetty Book](commetty/)**, a separate offline PWA for tracking commetty / chit-fund installments (`commetty/`).
+> Also in this repo: **[Commetty Book](commetty/)**, a separate tiny Go server + PWA for tracking commetty / chit-fund installments (`commetty/`).
 
 ## Features
 

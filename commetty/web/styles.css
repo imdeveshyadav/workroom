@@ -157,3 +157,18 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 .viewer[hidden] { display: none; }
 .viewer img { max-width: 100%; max-height: 100%; object-fit: contain; }
 .viewer-close { position: absolute; top: calc(12px + env(safe-area-inset-top)); right: 12px; width: 44px; height: 44px; border-radius: 50%; border: 0; background: rgb(255 255 255 / .15); color: #fff; font-size: 18px; }
+
+/* login, offline strip, server backup list */
+.login { min-height: 100vh; align-content: center; justify-items: center; text-align: center; }
+.login img { width: 84px; border-radius: 22px; }
+.login h1 { font-size: 24px; margin-bottom: 4px; }
+.login form { width: 100%; max-width: 360px; text-align: left; }
+.offline { background: var(--warn-bg); color: var(--warn); text-align: center; font-size: 13px; padding: 6px 12px; }
+.blist { display: grid; }
+.bi { display: flex; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.bi:last-child { border-bottom: 0; }
+.bi > div { flex: 1; display: grid; }
+.bi .icon-btn { text-decoration: none; font-size: 18px; }
+.btn.mini { min-height: 36px; padding: 0 12px; font-size: 14px; }
+.btn:disabled { opacity: .6; }
+code { font-size: 12px; background: var(--bg); padding: 1px 5px; border-radius: 5px; }

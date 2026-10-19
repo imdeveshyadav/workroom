@@ -63,7 +63,7 @@ function icon(scale, rounded) {
   };
 }
 
-const out = path.join(__dirname, '..', 'icons');
+const out = path.join(__dirname, '..', 'web', 'icons');
 fs.mkdirSync(out, { recursive: true });
 fs.writeFileSync(path.join(out, 'icon-192.png'), png(192, icon(1, true)));
 fs.writeFileSync(path.join(out, 'icon-512.png'), png(512, icon(1, true)));
