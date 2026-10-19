@@ -1,0 +1,26 @@
+# /etc/systemd/system/commetty.service
+[Unit]
+Description=Commetty Book
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=commetty
+WorkingDirectory=/var/lib/commetty
+ExecStart=/usr/local/bin/commetty
+EnvironmentFile=/etc/commetty.env
+Environment=DATA_DIR=/var/lib/commetty ADDR=127.0.0.1:8080 TRUST_PROXY=1
+Restart=always
+RestartSec=3
+# Hard caps — the app normally uses ~15 MB.
+MemoryMax=64M
+TasksMax=64
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/commetty
+
+[Install]
+WantedBy=multi-user.target
